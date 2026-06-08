@@ -1204,7 +1204,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     });
 
     try {
-      if (retrievePlan.entry === "turn_start_skip") {
+      if (input.skipRetrieval || retrievePlan.entry === "turn_start_skip") {
         const packet = emptyInjectionPacket(input.agent, sessionId, episode.id as EpisodeId, input.ts);
         turnStartRetrievalStats.set(
           packet.packetId,

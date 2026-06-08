@@ -31,6 +31,7 @@ import {
   flattenMessages,
   renderContextBlock,
 } from "../../../adapters/openclaw/bridge.js";
+import { resolveOpenClawPluginConfig } from "../../../adapters/openclaw/plugin-config.js";
 import {
   isStandaloneMathFinalAnswerTask,
   mergeMathFinalAnswerProtocol,
@@ -814,6 +815,25 @@ describe("bridgeSessionId", () => {
     expect(bridgeSessionId("main", "s1")).toBe("openclaw::main::s1");
     expect(bridgeSessionId("main", "s1")).toBe(bridgeSessionId("main", "s1"));
     expect(bridgeSessionId("main", "s2")).not.toBe(bridgeSessionId("main", "s1"));
+  });
+});
+
+describe("OpenClaw plugin feature config", () => {
+  it("defaults memory_search and memory_add to enabled", () => {
+    expect(resolveOpenClawPluginConfig(undefined)).toEqual({
+      memorySearchEnabled: true,
+      memoryAddEnabled: true,
+    });
+  });
+
+  it("reads nested OpenClaw switches", () => {
+    expect(resolveOpenClawPluginConfig({
+      memory_search: { enabled: false },
+      memory_add: { enabled: false },
+    })).toEqual({
+      memorySearchEnabled: false,
+      memoryAddEnabled: false,
+    });
   });
 });
 
@@ -1675,6 +1695,23 @@ describe("registerOpenClawTools", () => {
       expect(typeof t.descriptor.execute).toBe("function");
       expect(t.descriptor.parameters).toBeDefined();
     }
+  });
+
+  it("does not register memos_search when memory_search is disabled", async () => {
+    const mc = buildCore();
+    await mc.init();
+
+    const { api, tools } = collectTools();
+    registerOpenClawTools(api, {
+      agent: "openclaw",
+      core: mc,
+      log: silentLogger(),
+      memorySearchEnabled: false,
+    });
+
+    const names = tools.map((t) => t.descriptor.name);
+    expect(names).not.toContain("memos_search");
+    expect(names).toContain("memos_get");
   });
 
   it("memos_search executes against the core and returns well-formed hits", async () => {
