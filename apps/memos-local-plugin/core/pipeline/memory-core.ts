@@ -834,6 +834,12 @@ export function createMemoryCore(
   }
 
   function isStandaloneMathFinalAnswerTurn(turn: Parameters<MemoryCore["onTurnStart"]>[0]): boolean {
+    if (
+      turn.contextHints?.domain === "code_implementation" ||
+      turn.contextHints?.domain === "knowledge_work"
+    ) {
+      return false;
+    }
     return turn.contextHints?.taskKind === STANDALONE_MATH_FINAL_ANSWER_TASK_KIND ||
       isStandaloneMathFinalAnswerTask(turn.userText);
   }
@@ -1663,8 +1669,8 @@ export function createMemoryCore(
     let hubHits: RetrievalHitDTO[] = [];
     const ns = namespaceFor(turn.agent, turn);
     activeNamespace = ns;
-    const canUseProtocolFallback =
-      turn.contextHints?.__memosReadOnlyTurnStart === true || Boolean(turn.episodeId);
+    const canUseProtocolFallback = turn.skipRetrieval !== true &&
+      (turn.contextHints?.__memosReadOnlyTurnStart === true || Boolean(turn.episodeId));
     const protocolFallbackPacket = canUseProtocolFallback
       ? taskProtocolOnlyPacket({
           reason: "turn_start",
@@ -1688,6 +1694,28 @@ export function createMemoryCore(
       : null;
     try {
       const fullRetrieval = (async (): Promise<RetrievalResultDTO> => {
+        if (turn.skipRetrieval === true) {
+          packet = await handle.onTurnStart({
+            ...turn,
+            namespace: ns,
+            contextHints: {
+              ...(turn.contextHints ?? {}),
+              ...namespaceMeta(ns),
+            },
+          });
+          return {
+            query: {
+              agent: turn.agent,
+              namespace: ns,
+              sessionId: packet.sessionId,
+              episodeId: packet.episodeId,
+              query: turn.userText,
+            },
+            hits: [],
+            injectedContext: "",
+            tierLatencyMs: packet.tierLatencyMs,
+          };
+        }
         hubHits = await searchHubMemoryHits(turn.userText, 5);
         hubCandidates = logCandidatesFromHits(hubHits);
         const standaloneMathFinalAnswer = isStandaloneMathFinalAnswerTurn(turn);
@@ -1828,62 +1856,64 @@ export function createMemoryCore(
       // each real agent turn. Without this, `memos_search` rows
       // only showed up when the viewer's search box was used.
       try {
-        const snippets = packet?.snippets ?? [];
-        const candidates = snippets.map((s) => ({
-          tier: inferTier(s.refKind),
-          refKind: s.refKind,
-          refId: s.refId,
-          score: s.score ?? 0,
-          snippet: s.body,
-        }));
-        const droppedIds = new Set(
-          (packet?.droppedByLlm ?? []).map((s) => s.refId as string),
-        );
-        const localFiltered = candidates.filter((c) => !droppedIds.has(c.refId));
-        const filtered = hubCandidates.length > 0
-          ? finalFilteredCandidates
-          : localFiltered;
-        const localDropped = candidates.filter((c) => droppedIds.has(c.refId));
-        const dropped = hubCandidates.length > 0
-          ? [...localDropped, ...finalDroppedCandidates]
-          : localDropped;
-        const stats = packet ? handle.consumeRetrievalStats(packet.packetId) : null;
-        handle.repos.apiLogs.insert({
-          toolName: "memos_search",
-          input: {
-            type: "turn_start",
-            agent: turn.agent,
-            query: turn.userText.slice(0, 2_000),
-            sessionId: packet?.sessionId ?? turn.sessionId ?? null,
-            episodeId: packet?.episodeId ?? turn.episodeId ?? null,
-          },
-          output: ok
-            ? {
-                candidates,
-                hubCandidates,
-                filtered,
-                droppedByLlm: dropped,
-                stats: stats
-                  ? withHubStats(
-                      retrievalStatsPayload(stats),
-                      hubCandidates.length,
-                      filtered.length,
-                      finalHubKept,
-                      finalFilterStats,
-                    )
-                  : undefined,
-              }
-            : { error: "turn_start_retrieval_failed" },
-          durationMs: Date.now() - startedAt,
-          success: ok,
-          calledAt: startedAt,
-        });
+        if (turn.skipRetrieval !== true) {
+          const snippets = packet?.snippets ?? [];
+          const candidates = snippets.map((s) => ({
+            tier: inferTier(s.refKind),
+            refKind: s.refKind,
+            refId: s.refId,
+            score: s.score ?? 0,
+            snippet: s.body,
+          }));
+          const droppedIds = new Set(
+            (packet?.droppedByLlm ?? []).map((s) => s.refId as string),
+          );
+          const localFiltered = candidates.filter((c) => !droppedIds.has(c.refId));
+          const filtered = hubCandidates.length > 0
+            ? finalFilteredCandidates
+            : localFiltered;
+          const localDropped = candidates.filter((c) => droppedIds.has(c.refId));
+          const dropped = hubCandidates.length > 0
+            ? [...localDropped, ...finalDroppedCandidates]
+            : localDropped;
+          const stats = packet ? handle.consumeRetrievalStats(packet.packetId) : null;
+          handle.repos.apiLogs.insert({
+            toolName: "memos_search",
+            input: {
+              type: "turn_start",
+              agent: turn.agent,
+              query: turn.userText.slice(0, 2_000),
+              sessionId: packet?.sessionId ?? turn.sessionId ?? null,
+              episodeId: packet?.episodeId ?? turn.episodeId ?? null,
+            },
+            output: ok
+              ? {
+                  candidates,
+                  hubCandidates,
+                  filtered,
+                  droppedByLlm: dropped,
+                  stats: stats
+                    ? withHubStats(
+                        retrievalStatsPayload(stats),
+                        hubCandidates.length,
+                        filtered.length,
+                        finalHubKept,
+                        finalFilterStats,
+                      )
+                    : undefined,
+                }
+              : { error: "turn_start_retrieval_failed" },
+            durationMs: Date.now() - startedAt,
+            success: ok,
+            calledAt: startedAt,
+          });
+        }
       } catch (logErr) {
         log.debug("apiLogs.memos_search.turn_start.skipped", {
           err: logErr instanceof Error ? logErr.message : String(logErr),
         });
       }
-      if (telemetry && ok) {
+      if (turn.skipRetrieval !== true && telemetry && ok) {
         telemetry.trackTurnStart(
           turn.agent,
           Date.now() - startedAt,

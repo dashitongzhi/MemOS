@@ -34,6 +34,11 @@ import {
   DuplicateOpenClawRuntimeError,
   type OpenClawRuntimeLockHandle,
 } from "./runtime-lock.js";
+import {
+  OPENCLAW_PLUGIN_CONFIG_SCHEMA,
+  type OpenClawPluginFeatureConfig,
+  resolveOpenClawPluginConfig,
+} from "./plugin-config.js";
 import { registerOpenClawTools } from "./tools.js";
 import type {
   DefinedPluginEntry,
@@ -81,9 +86,9 @@ interface PluginRuntime {
   core: MemoryCore;
   bridge: BridgeHandle;
   /**
-   * The viewer HTTP server. OpenClaw must own this port; if binding
-   * fails we abort bootstrap instead of running a second headless
-   * runtime that would still register hooks and write memory.
+   * The viewer HTTP server. Owner runtimes must bind it. Search-only duplicate
+   * runtimes deliberately run headless and leave the existing viewer/runtime
+   * owner in place.
    */
   viewer: ServerHandle | null;
   shutdown: () => Promise<void>;
@@ -163,21 +168,32 @@ function isReadOnlyRuntime(): boolean {
   return envFlag(process.env.OPENCLAW_MEMOS_READONLY ?? process.env.MEMOS_READONLY);
 }
 
-function memoryAddDisabledFromConfig(config: Record<string, unknown> | undefined): boolean {
-  const memoryAdd = config?.memory_add;
-  if (!memoryAdd || typeof memoryAdd !== "object" || Array.isArray(memoryAdd)) {
-    return false;
-  }
-  return (memoryAdd as { enabled?: unknown }).enabled === false;
+function truthyEnv(name: string): boolean {
+  const value = process.env[name];
+  return value != null && !["", "0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
+
+function memoryWritesDisabled(featureConfig: OpenClawPluginFeatureConfig): boolean {
+  return (
+    featureConfig.memoryAddEnabled === false ||
+    truthyEnv("MEMOS_MEMORY_ADD_DISABLED") ||
+    truthyEnv("EVOAGENTBENCH_MEMOS_DISABLE_ADD")
+  );
 }
 
 async function createRuntime(
   api: OpenClawPluginApi,
   runtimeLock: OpenClawRuntimeLockHandle | null,
-  opts: { readOnly: boolean } = { readOnly: false },
+  featureConfig: OpenClawPluginFeatureConfig,
+  opts: { readOnly: boolean; headlessDuplicateSearchOnly?: boolean },
 ): Promise<PluginRuntime> {
   const log = rootLogger.child({ channel: "adapters.openclaw" });
-  log.info("plugin.bootstrap", { version: PLUGIN_VERSION, readOnly: opts.readOnly });
+  log.info("plugin.bootstrap", {
+    version: PLUGIN_VERSION,
+    readOnly: opts.readOnly,
+    memorySearchEnabled: featureConfig.memorySearchEnabled,
+    memoryAddEnabled: featureConfig.memoryAddEnabled,
+  });
 
   let core: MemoryCore | null = null;
   let viewer: ServerHandle | null = null;
@@ -227,13 +243,19 @@ async function createRuntime(
       agent: "openclaw",
       core,
       log: api.logger,
-      memoryAddDisabled: memoryAddDisabledFromConfig(api.pluginConfig),
+      memorySearchEnabled: featureConfig.memorySearchEnabled,
+      memoryAddEnabled: featureConfig.memoryAddEnabled,
       readOnlyInjectionProfile: config.algorithm.retrieval.readOnlyInjectionProfile,
       domain: config.domain,
     });
 
     if (opts.readOnly) {
       api.logger.info("memos-local: read-only runtime; skipping exclusive viewer binding");
+    } else if (opts.headlessDuplicateSearchOnly) {
+      api.logger.warn(
+        "memos-local: duplicate runtime allowed because memory_add is disabled; " +
+          "running search-only headless embedded runtime.",
+      );
     } else {
       // OpenClaw's viewer port is fixed at :18799 (hermes uses :18800).
       // We ignore `config.viewer.port` for the same reason `bridge.cts`
@@ -323,9 +345,13 @@ async function closeViewerAfterFailedBootstrap(
   }
 }
 
-function createSharedRuntimeState(api: OpenClawPluginApi): SharedRuntimeState {
+function createSharedRuntimeState(
+  api: OpenClawPluginApi,
+  featureConfig: OpenClawPluginFeatureConfig,
+): SharedRuntimeState {
   const readOnly = isReadOnlyRuntime();
   let runtimeLock: OpenClawRuntimeLockHandle | null = null;
+  let headlessDuplicateSearchOnly = false;
   if (readOnly) {
     api.logger.info("memos-local: readonly runtime lock bypassed");
   } else {
@@ -338,11 +364,19 @@ function createSharedRuntimeState(api: OpenClawPluginApi): SharedRuntimeState {
       });
     } catch (err) {
       const duplicate = err instanceof DuplicateOpenClawRuntimeError;
-      api.logger.error("memos-local: duplicate OpenClaw runtime blocked", {
+      const writesDisabled = memoryWritesDisabled(featureConfig);
+      const level = duplicate && writesDisabled ? "warn" : "error";
+      api.logger[level]("memos-local: duplicate OpenClaw runtime blocked", {
         err: err instanceof Error ? err.message : String(err),
         code: duplicate ? err.code : (err as { code?: unknown }).code,
+        memoryAddEnabled: featureConfig.memoryAddEnabled,
+        writesDisabled,
       });
-      throw err;
+      if (!duplicate || !writesDisabled) {
+        throw err;
+      }
+      runtimeLock = null;
+      headlessDuplicateSearchOnly = true;
     }
   }
 
@@ -352,7 +386,10 @@ function createSharedRuntimeState(api: OpenClawPluginApi): SharedRuntimeState {
     bootstrapError: null,
     bootstrapPromise: Promise.resolve(),
   };
-  state.bootstrapPromise = createRuntime(api, runtimeLock, { readOnly })
+  state.bootstrapPromise = createRuntime(api, runtimeLock, featureConfig, {
+    readOnly,
+    headlessDuplicateSearchOnly,
+  })
     .then((runtime) => {
       state.runtime = runtime;
       api.logger.info("memos-local: plugin ready");
@@ -371,16 +408,17 @@ function createSharedRuntimeState(api: OpenClawPluginApi): SharedRuntimeState {
 // ─── Registration ──────────────────────────────────────────────────────────
 
 function register(api: OpenClawPluginApi): void {
+  const featureConfig = resolveOpenClawPluginConfig(api.pluginConfig);
   let state = readSharedRuntimeState();
   if (!state) {
-    state = createSharedRuntimeState(api);
+    state = createSharedRuntimeState(api, featureConfig);
     writeSharedRuntimeState(state);
   } else {
     api.logger.info("memos-local: reusing in-process shared runtime");
   }
   state.registrations += 1;
 
-  if (memoryAddDisabledFromConfig(api.pluginConfig)) {
+  if (memoryWritesDisabled(featureConfig)) {
     api.logger.info(
       "memos-local: memory_add disabled; allowing concurrent read-only runtime",
     );
@@ -391,6 +429,7 @@ function register(api: OpenClawPluginApi): void {
   //    fails later.
   api.registerMemoryCapability?.({
     promptBuilder: ({ availableTools }) => {
+      if (!featureConfig.memorySearchEnabled) return [];
       const hasSearch = availableTools.has("memos_search");
       const hasGet = availableTools.has("memos_get");
       const hasTimeline = availableTools.has("memos_timeline");
@@ -451,6 +490,7 @@ function register(api: OpenClawPluginApi): void {
     agent: "openclaw",
     getCore: async () => (await ensureRuntime())?.core ?? null,
     log: api.logger,
+    memorySearchEnabled: featureConfig.memorySearchEnabled,
   });
 
   // 3. Hooks — every handler matches the upstream `PluginHookHandlerMap`
@@ -548,6 +588,7 @@ const plugin: DefinedPluginEntry = {
   description:
     "Reflect2Evolve memory plugin — L1 traces, L2 policies, L3 world models, " +
     "skill crystallization, three-tier retrieval, decision repair.",
+  configSchema: OPENCLAW_PLUGIN_CONFIG_SCHEMA,
   register,
 };
 
@@ -561,6 +602,7 @@ export function defineMemosLocalOpenClawPlugin(
     id: overrides?.id ?? PLUGIN_ID,
     name: overrides?.name ?? "MemOS Local",
     description: overrides?.description ?? plugin.description,
+    configSchema: overrides?.configSchema ?? OPENCLAW_PLUGIN_CONFIG_SCHEMA,
     register: overrides?.register ?? register,
   };
 }
