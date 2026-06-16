@@ -77,6 +77,7 @@ import { loadConfig, resolveHome, SECRET_FIELD_PATHS } from "../config/index.js"
 import { reflectionAsText } from "../capture/types.js";
 import { effectiveReadOnlyInjectionProfile } from "../domain.js";
 import { feedbackText } from "../experience/feedback-builder.js";
+import { buildPolicyVectorText } from "../experience/policy-vector-text.js";
 import { rootLogger } from "../logger/index.js";
 import type { Logger } from "../logger/types.js";
 import { openDb } from "../storage/connection.js";
@@ -4337,13 +4338,7 @@ export function createMemoryCore(
   }
 
   function policyEmbeddingText(row: PolicyRow): string {
-    return [
-      row.title,
-      row.trigger,
-      row.procedure,
-      row.verification,
-      row.boundary,
-    ].filter(Boolean).join("\n") || "(empty)";
+    return buildPolicyVectorText(row);
   }
 
   function worldModelEmbeddingText(row: WorldModelRow): string {
